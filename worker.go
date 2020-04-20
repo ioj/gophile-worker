@@ -14,7 +14,7 @@ Example:
   	"github.com/ioj/gophile-worker/middleware"
   )
 
-  type msgpayload struct {
+  type HelloPayload struct {
   	Name string `json:"name"`
   }
 
@@ -33,7 +33,7 @@ Example:
   		return nil
   	})
 
-  	log.Fatal(w.ListenAndServe("dbname=testworker sslmode=disable"))
+  	log.Fatal(w.ListenAndServe("dbname=worker_test sslmode=disable"))
 	}
 */
 package worker
