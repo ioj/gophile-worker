@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // Opts contains parameters for worker.New().
@@ -47,6 +49,8 @@ func optsWithDefaults(orig *Opts) *Opts {
 	if opts.Schema == "" {
 		opts.Schema = "graphile_worker"
 	}
+
+	opts.Schema = pq.QuoteIdentifier(opts.Schema)
 
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 2 * time.Second

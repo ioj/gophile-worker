@@ -61,6 +61,13 @@ type HandlerFunc func(ctx context.Context, job *Job) error
 // MiddlewareFunc defines a function to process middleware.
 type MiddlewareFunc func(HandlerFunc) HandlerFunc
 
+// Used by Worker.stmts map
+const (
+	getJobStmt = iota
+	failJobStmt
+	completeJobStmt
+)
+
 // Worker is the root of your worker application. You should instantiate one
 // of these and call ListenAndServe() to start accepting jobs.
 //
@@ -75,6 +82,9 @@ type Worker struct {
 	handlerfuncs map[string]HandlerFunc
 	supportedIDs pq.StringArray
 	runningtasks sync.WaitGroup
+
+	// Prepared statements.
+	stmts map[int]*sql.Stmt
 
 	listening bool
 	shutdown  chan bool
@@ -104,6 +114,12 @@ func (w *Worker) ID() string {
 // It might be null if worker wasn't started yet.
 func (w *Worker) DB() *sql.DB {
 	return w.db
+}
+
+// Schema returns a quoted schema name used by the worker,
+// as configured in Opts.
+func (w *Worker) Schema() string {
+	return w.opts.Schema
 }
 
 // Handle registers the handler for the given task ID.
@@ -152,6 +168,10 @@ func (w *Worker) ListenAndServe(conninfo string) error {
 		return err
 	}
 
+	if err := w.prepareStmts(); err != nil {
+		return err
+	}
+
 	listener := pq.NewListener(conninfo,
 		w.opts.MinReconnectInterval, w.opts.MaxReconnectInterval, nil)
 	err = listener.Listen("jobs:insert")
@@ -161,7 +181,7 @@ func (w *Worker) ListenAndServe(conninfo string) error {
 
 	for {
 		if err := w.getJob(); err != nil {
-			fmt.Println(err)
+			panic(err)
 		}
 
 		select {
@@ -177,6 +197,10 @@ shutdown:
 	w.runningtasks.Wait()
 	if err := listener.Close(); err != nil {
 		return err
+	}
+
+	if err := w.closePreparedStmts(); err != nil {
+		return nil
 	}
 
 	return w.db.Close()
@@ -201,6 +225,45 @@ func (w *Worker) Use(middlewares ...MiddlewareFunc) {
 	w.middlewares = append(w.middlewares, middlewares...)
 }
 
+func (w *Worker) closePreparedStmts() error {
+	for _, stmt := range w.stmts {
+		if err := stmt.Close(); err != nil {
+			return err
+		}
+	}
+
+	w.stmts = nil
+	return nil
+}
+
+func (w *Worker) prepareStmts() error {
+	var err error
+
+	if w.stmts == nil {
+		w.stmts = make(map[int]*sql.Stmt)
+	} else {
+		w.closePreparedStmts()
+	}
+
+	w.stmts[getJobStmt], err = w.db.Prepare(fmt.Sprintf(`
+		SELECT id, queue_name, task_identifier, payload
+		FROM %v.get_job($1, $2)`, w.opts.Schema))
+	if err != nil {
+		return err
+	}
+
+	w.stmts[completeJobStmt], err = w.db.Prepare(fmt.Sprintf(`
+		SELECT FROM %v.complete_job($1, $2)`, w.opts.Schema))
+	if err != nil {
+		return err
+	}
+
+	w.stmts[failJobStmt], err = w.db.Prepare(fmt.Sprintf(`
+		SELECT FROM %v.fail_job($1, $2, $3)`, w.opts.Schema))
+
+	return err
+}
+
 func (w *Worker) getJob() error {
 	for {
 		var id sql.NullInt64
@@ -208,9 +271,7 @@ func (w *Worker) getJob() error {
 		var taskID sql.NullString
 		var payload []byte
 
-		if err := w.db.QueryRow(`
-			SELECT id, queue_name, task_identifier, payload
-			FROM graphile_worker.get_job($1, $2)`, w.opts.ID, w.supportedIDs).
+		if err := w.stmts[getJobStmt].QueryRow(w.opts.ID, w.supportedIDs).
 			Scan(&id, &queueName, &taskID, &payload); err != nil {
 			return err
 		}
@@ -236,14 +297,12 @@ func (w *Worker) getJob() error {
 }
 
 func (w *Worker) failJob(job *Job, e error) error {
-	_, err := w.db.Exec(`SELECT FROM graphile_worker.fail_job($1, $2, $3)`,
-		w.opts.ID, job.ID, e.Error())
+	_, err := w.stmts[failJobStmt].Exec(w.opts.ID, job.ID, e.Error())
 	return err
 }
 
 func (w *Worker) completeJob(job *Job) error {
-	_, err := w.db.Exec(`SELECT FROM graphile_worker.complete_job($1, $2)`,
-		w.opts.ID, job.ID)
+	_, err := w.stmts[completeJobStmt].Exec(w.opts.ID, job.ID)
 	return err
 }
 
