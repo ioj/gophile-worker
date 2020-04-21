@@ -33,14 +33,16 @@ func main() {
 		return nil
 	})
 
-	w.Handle("totaljobs", func(ctx context.Context, job *worker.Job) error {
-		db := ctx.Value(worker.CtxWorker).(*worker.Worker).DB()
+	w.Handle("jobcount", func(ctx context.Context, job *worker.Job) error {
+		w := ctx.Value(worker.CtxWorker).(*worker.Worker)
+
+		db := w.DB()
 		if db == nil {
 			return errors.New("db handle is nil")
 		}
 
 		var count int
-		stmt := `SELECT count(*) FROM graphile_worker.jobs`
+		stmt := fmt.Sprintf(`SELECT count(*) FROM %v.jobs`, w.Schema())
 		if err := db.QueryRowContext(ctx, stmt).Scan(&count); err != nil {
 			return err
 		}
