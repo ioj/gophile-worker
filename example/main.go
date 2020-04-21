@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -29,6 +30,22 @@ func main() {
 		}
 
 		fmt.Printf("Hello, %v!\n", p.Name)
+		return nil
+	})
+
+	w.Handle("totaljobs", func(ctx context.Context, job *worker.Job) error {
+		db := ctx.Value(worker.CtxWorker).(*worker.Worker).DB()
+		if db == nil {
+			return errors.New("db handle is nil")
+		}
+
+		var count int
+		stmt := `SELECT count(*) FROM graphile_worker.jobs`
+		if err := db.QueryRowContext(ctx, stmt).Scan(&count); err != nil {
+			return err
+		}
+
+		fmt.Printf("total jobs in queue: %v\n", count)
 		return nil
 	})
 

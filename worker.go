@@ -49,6 +49,12 @@ import (
 	"github.com/lib/pq"
 )
 
+// CtxKey is a key type for context values passed to handlers.
+type CtxKey string
+
+// CtxWorker is a context key which holds the worker instance.
+const CtxWorker CtxKey = "worker"
+
 // HandlerFunc defines a function to serve tasks.
 type HandlerFunc func(ctx context.Context, job *Job) error
 
@@ -92,6 +98,12 @@ func New(opts *Opts) *Worker {
 // ID returns the worker ID.
 func (w *Worker) ID() string {
 	return w.opts.ID
+}
+
+// DB returns the pointer to the underlying *sql.DB.
+// It might be null if worker wasn't started yet.
+func (w *Worker) DB() *sql.DB {
+	return w.db
 }
 
 // Handle registers the handler for the given task ID.
@@ -256,7 +268,9 @@ func (w *Worker) doJob(job *Job) {
 		h = w.middlewares[i](h)
 	}
 
-	if err := h(context.Background(), job); err != nil {
+	ctx := context.WithValue(context.Background(), CtxWorker, w)
+
+	if err := h(ctx, job); err != nil {
 		// TODO: retry mechanism
 		ferr := w.failJob(job, err)
 		if ferr != nil {
