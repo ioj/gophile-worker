@@ -121,6 +121,10 @@ func (w *Worker) Handle(taskID string, task HandlerFunc) {
 // for incoming jobs. When a matching job appears, it is dispatched
 // to a HandlerFunc.
 func (w *Worker) ListenAndServe(conninfo string) error {
+	if w.listening {
+		return errors.New("worker is already listening")
+	}
+
 	if len(w.supportedIDs) == 0 {
 		return errors.New("no registered tasks")
 	}
@@ -129,6 +133,10 @@ func (w *Worker) ListenAndServe(conninfo string) error {
 
 	var err error
 	if w.db, err = sql.Open("postgres", conninfo); err != nil {
+		return err
+	}
+
+	if err := w.db.Ping(); err != nil {
 		return err
 	}
 
@@ -174,6 +182,10 @@ func (w *Worker) Shutdown() {
 // change the course of the request execution, or set request-scoped values for
 // the next Handler.
 func (w *Worker) Use(middlewares ...MiddlewareFunc) {
+	if w.listening {
+		panic("adding middleware when listening is forbidden")
+	}
+
 	w.middlewares = append(w.middlewares, middlewares...)
 }
 
