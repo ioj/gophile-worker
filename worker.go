@@ -44,9 +44,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // CtxKey is a key type for context values passed to handlers.
@@ -75,19 +75,19 @@ const (
 type Worker struct {
 	opts *Opts
 
-	db *sql.DB
+	pool        *pgxpool.Pool
+	schemaident pgx.Identifier
 
 	middlewares []MiddlewareFunc
 
 	handlerfuncs map[string]HandlerFunc
-	supportedIDs pq.StringArray
+	supportedIDs []string
 	runningtasks sync.WaitGroup
 
 	// Prepared statements.
-	stmts map[int]*sql.Stmt
+	stmts map[int]string
 
 	listening bool
-	shutdown  chan bool
 }
 
 // New initialises a new Worker. Configuration options are provided
@@ -101,8 +101,26 @@ type Worker struct {
 //     opts    := &worker.Opts{Schema: "worker"}
 //     worker  := worker.New(opts)
 //
-func New(opts *Opts) *Worker {
-	return &Worker{opts: optsWithDefaults(opts)}
+func New(pool *pgxpool.Pool, opts *Opts) *Worker {
+	o := optsWithDefaults(opts)
+	w := &Worker{
+		pool:        pool,
+		opts:        o,
+		stmts:       make(map[int]string),
+		schemaident: pgx.Identifier{o.Schema},
+	}
+
+	w.stmts[getJobStmt] = fmt.Sprintf(`
+		SELECT id, queue_name, task_identifier, payload
+		FROM %v.get_job($1, $2)`, w.schemaident.Sanitize())
+
+	w.stmts[completeJobStmt] = fmt.Sprintf(`
+		SELECT FROM %v.complete_job($1, $2)`, w.schemaident.Sanitize())
+
+	w.stmts[failJobStmt] = fmt.Sprintf(`
+		SELECT FROM %v.fail_job($1, $2, $3)`, w.schemaident.Sanitize())
+
+	return w
 }
 
 // ID returns the worker ID.
@@ -110,16 +128,16 @@ func (w *Worker) ID() string {
 	return w.opts.ID
 }
 
-// DB returns the pointer to the underlying *sql.DB.
+// Pool returns the pointer to the underlying *pgxpool.DB.
 // It might be null if worker wasn't started yet.
-func (w *Worker) DB() *sql.DB {
-	return w.db
+func (w *Worker) Pool() *pgxpool.Pool {
+	return w.pool
 }
 
 // Schema returns a quoted schema name used by the worker,
 // as configured in Opts.
-func (w *Worker) Schema() string {
-	return w.opts.Schema
+func (w *Worker) Schema() pgx.Identifier {
+	return w.schemaident
 }
 
 // Handle registers the handler for the given task ID.
@@ -148,7 +166,7 @@ func (w *Worker) Handle(taskID string, task HandlerFunc) {
 // ListenAndServe opens a connection to the database and starts listening
 // for incoming jobs. When a matching job appears, it is dispatched
 // to a HandlerFunc.
-func (w *Worker) ListenAndServe(conninfo string) error {
+func (w *Worker) ListenAndServe(ctx context.Context) error {
 	if w.listening {
 		return errors.New("worker is already listening")
 	}
@@ -157,58 +175,48 @@ func (w *Worker) ListenAndServe(conninfo string) error {
 		return errors.New("no registered tasks")
 	}
 
-	w.shutdown = make(chan bool, 1)
-
-	var err error
-	if w.db, err = sql.Open("postgres", conninfo); err != nil {
+	poolconn, err := w.pool.Acquire(ctx)
+	if err != nil {
 		return err
 	}
+	defer poolconn.Release()
 
-	if err := w.db.Ping(); err != nil {
-		return err
-	}
-
-	if err := w.prepareStmts(); err != nil {
-		return err
-	}
-
-	listener := pq.NewListener(conninfo,
-		w.opts.MinReconnectInterval, w.opts.MaxReconnectInterval, nil)
-	err = listener.Listen("jobs:insert")
+	conn := poolconn.Conn()
+	_, err = conn.Exec(ctx, "listen \"jobs:insert\"")
 	if err != nil {
 		return err
 	}
 
 	for {
-		if err := w.getJob(); err != nil {
-			panic(err)
+		if err = w.getJob(context.Background()); err != nil {
+			break
 		}
 
-		select {
-		case <-w.shutdown:
-			goto shutdown
-		case <-listener.Notify:
-		case <-time.After(w.opts.PollInterval):
-			go listener.Ping()
+		if _, err = conn.WaitForNotification(ctx); err != nil {
+			// This is a workaround for a pgx bug where it doesn't return
+			// ctx.Err() when the context is canceled, but i/o timeout to the database.
+			select {
+			case <-ctx.Done():
+				if ctx.Err() == context.Canceled {
+					err = nil
+				}
+			default:
+			}
+			break
+		}
+
+		if err = ctx.Err(); err != nil {
+			break
 		}
 	}
 
-shutdown:
 	w.runningtasks.Wait()
-	if err := listener.Close(); err != nil {
-		return err
-	}
 
-	if err := w.closePreparedStmts(); err != nil {
+	if err == context.Canceled {
 		return nil
 	}
 
-	return w.db.Close()
-}
-
-// Shutdown gracefully shuts down the worker without interrupting any active tasks.
-func (w *Worker) Shutdown() {
-	w.shutdown <- true
+	return err
 }
 
 // Use appends a middleware handler to the Worker middleware stack.
@@ -225,53 +233,14 @@ func (w *Worker) Use(middlewares ...MiddlewareFunc) {
 	w.middlewares = append(w.middlewares, middlewares...)
 }
 
-func (w *Worker) closePreparedStmts() error {
-	for _, stmt := range w.stmts {
-		if err := stmt.Close(); err != nil {
-			return err
-		}
-	}
-
-	w.stmts = nil
-	return nil
-}
-
-func (w *Worker) prepareStmts() error {
-	var err error
-
-	if w.stmts == nil {
-		w.stmts = make(map[int]*sql.Stmt)
-	} else {
-		w.closePreparedStmts()
-	}
-
-	w.stmts[getJobStmt], err = w.db.Prepare(fmt.Sprintf(`
-		SELECT id, queue_name, task_identifier, payload
-		FROM %v.get_job($1, $2)`, w.opts.Schema))
-	if err != nil {
-		return err
-	}
-
-	w.stmts[completeJobStmt], err = w.db.Prepare(fmt.Sprintf(`
-		SELECT FROM %v.complete_job($1, $2)`, w.opts.Schema))
-	if err != nil {
-		return err
-	}
-
-	w.stmts[failJobStmt], err = w.db.Prepare(fmt.Sprintf(`
-		SELECT FROM %v.fail_job($1, $2, $3)`, w.opts.Schema))
-
-	return err
-}
-
-func (w *Worker) getJob() error {
+func (w *Worker) getJob(ctx context.Context) error {
 	for {
 		var id sql.NullInt64
 		var queueName sql.NullString
 		var taskID sql.NullString
 		var payload []byte
 
-		if err := w.stmts[getJobStmt].QueryRow(w.opts.ID, w.supportedIDs).
+		if err := w.pool.QueryRow(ctx, w.stmts[getJobStmt], w.opts.ID, w.supportedIDs).
 			Scan(&id, &queueName, &taskID, &payload); err != nil {
 			return err
 		}
@@ -291,22 +260,22 @@ func (w *Worker) getJob() error {
 		go func(job *Job) {
 			w.runningtasks.Add(1)
 			defer w.runningtasks.Done()
-			w.doJob(job)
+			w.doJob(ctx, job)
 		}(job)
 	}
 }
 
-func (w *Worker) failJob(job *Job, e error) error {
-	_, err := w.stmts[failJobStmt].Exec(w.opts.ID, job.ID, e.Error())
+func (w *Worker) failJob(ctx context.Context, job *Job, e error) error {
+	_, err := w.pool.Exec(ctx, w.stmts[failJobStmt], w.opts.ID, job.ID, e.Error())
 	return err
 }
 
-func (w *Worker) completeJob(job *Job) error {
-	_, err := w.stmts[completeJobStmt].Exec(w.opts.ID, job.ID)
+func (w *Worker) completeJob(ctx context.Context, job *Job) error {
+	_, err := w.pool.Exec(ctx, w.stmts[completeJobStmt], w.opts.ID, job.ID)
 	return err
 }
 
-func (w *Worker) doJob(job *Job) {
+func (w *Worker) doJob(ctx context.Context, job *Job) {
 	h, ok := w.handlerfuncs[job.TaskID]
 	if !ok {
 		panic("got task without handler. this should never happen")
@@ -319,7 +288,7 @@ func (w *Worker) doJob(job *Job) {
 			if !ok {
 				err = fmt.Errorf("panic: %v", r)
 			}
-			w.failJob(job, err)
+			w.failJob(ctx, job, err)
 		}
 	}()
 
@@ -327,17 +296,17 @@ func (w *Worker) doJob(job *Job) {
 		h = w.middlewares[i](h)
 	}
 
-	ctx := context.WithValue(context.Background(), CtxWorker, w)
+	ctx = context.WithValue(ctx, CtxWorker, w)
 
 	if err := h(ctx, job); err != nil {
 		// TODO: retry mechanism
-		ferr := w.failJob(job, err)
+		ferr := w.failJob(ctx, job, err)
 		if ferr != nil {
 			panic("couldn't fail job: " + ferr.Error())
 		}
 	} else {
 		// TODO: retry mechanism
-		ferr := w.completeJob(job)
+		ferr := w.completeJob(ctx, job)
 		if ferr != nil {
 			panic("couldn't complete job: " + ferr.Error())
 		}

@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	worker "github.com/ioj/gophile-worker"
 	"github.com/ioj/gophile-worker/middleware"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // HelloPayload defines a payload for the "hello" task.
@@ -19,7 +21,14 @@ type HelloPayload struct {
 }
 
 func main() {
-	w := worker.New(nil)
+	conninfo := "dbname=worker_test sslmode=disable"
+	pool, err := pgxpool.Connect(context.Background(), conninfo)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	w := worker.New(pool, nil)
 
 	w.Use(middleware.Logger)
 
@@ -33,17 +42,24 @@ func main() {
 		return nil
 	})
 
+	w.Handle("longtask", func(ctx context.Context, job *worker.Job) error {
+		fmt.Printf("doing long task...")
+		time.Sleep(5 * time.Second)
+		fmt.Printf("long task done...")
+		return nil
+	})
+
 	w.Handle("jobcount", func(ctx context.Context, job *worker.Job) error {
 		w := ctx.Value(worker.CtxWorker).(*worker.Worker)
 
-		db := w.DB()
+		db := w.Pool()
 		if db == nil {
 			return errors.New("db handle is nil")
 		}
 
 		var count int
-		stmt := fmt.Sprintf(`SELECT count(*) FROM %v.jobs`, w.Schema())
-		if err := db.QueryRowContext(ctx, stmt).Scan(&count); err != nil {
+		stmt := fmt.Sprintf(`SELECT count(*) FROM %v.jobs`, w.Schema().Sanitize())
+		if err := db.QueryRow(ctx, stmt).Scan(&count); err != nil {
 			return err
 		}
 
@@ -51,18 +67,19 @@ func main() {
 		return nil
 	})
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGTERM)
 	signal.Notify(c, syscall.SIGINT)
 	go func() {
 		<-c
-		w.Shutdown()
+		cancel()
 	}()
 
-	conninfo := "dbname=worker_test sslmode=disable"
-	if err := w.ListenAndServe(conninfo); err != nil {
+	if err := w.ListenAndServe(ctx); err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Graceful shutdown.")
+	fmt.Println("graceful shutdown")
 }
