@@ -44,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -163,18 +164,7 @@ func (w *Worker) Handle(taskID string, task HandlerFunc) {
 	w.supportedIDs = append(w.supportedIDs, taskID)
 }
 
-// ListenAndServe opens a connection to the database and starts listening
-// for incoming jobs. When a matching job appears, it is dispatched
-// to a HandlerFunc.
-func (w *Worker) ListenAndServe(ctx context.Context) error {
-	if w.listening {
-		return errors.New("worker is already listening")
-	}
-
-	if len(w.supportedIDs) == 0 {
-		return errors.New("no registered tasks")
-	}
-
+func (w *Worker) waitForNotification(ctx context.Context, noti chan bool) error {
 	poolconn, err := w.pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -188,10 +178,6 @@ func (w *Worker) ListenAndServe(ctx context.Context) error {
 	}
 
 	for {
-		if err = w.getJob(context.Background()); err != nil {
-			break
-		}
-
 		if _, err = conn.WaitForNotification(ctx); err != nil {
 			// This is a workaround for a pgx bug where it doesn't return
 			// ctx.Err() when the context is canceled, but i/o timeout to the database.
@@ -208,14 +194,61 @@ func (w *Worker) ListenAndServe(ctx context.Context) error {
 		if err = ctx.Err(); err != nil {
 			break
 		}
+
+		noti <- true
 	}
+
+	return nil
+}
+
+// ListenAndServe opens a connection to the database and starts listening
+// for incoming jobs. When a matching job appears, it is dispatched
+// to a HandlerFunc.
+func (w *Worker) ListenAndServe(ctx context.Context) error {
+	if w.listening {
+		return errors.New("worker is already listening")
+	}
+
+	if len(w.supportedIDs) == 0 {
+		return errors.New("no registered tasks")
+	}
+
+	noti := make(chan bool)
+	errs := make(chan error)
+
+	go func() {
+		err := w.waitForNotification(ctx, noti)
+		if err != nil {
+			errs <- err
+		}
+	}()
+
+	var err error
+
+	for {
+		select {
+		case <-noti:
+			if err = w.getJob(context.Background()); err != nil {
+				goto done
+			}
+		case <-time.Tick(w.opts.PollInterval):
+			if err = w.getJob(context.Background()); err != nil {
+				goto done
+			}
+		case <-ctx.Done():
+			if ctx.Err() == context.Canceled {
+				err = nil
+			}
+			goto done
+		case e := <-errs:
+			err = e
+			goto done
+		}
+	}
+
+done:
 
 	w.runningtasks.Wait()
-
-	if err == context.Canceled {
-		return nil
-	}
-
 	return err
 }
 
